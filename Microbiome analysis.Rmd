@@ -1,0 +1,1541 @@
+---
+title: "Cobos-Uribe et al 2024: Microbiome Analysis"
+author: "Catalina Cobos-Uribe"
+date: "2024-12-18"
+output: html_document
+---
+
+# Purpose
+This script analyses the microbiome data from the study by Cobos-Uribe et al. (2024). This study aimed to investigate the effect of controlled wood smoke exposure on the respiratory microbiome and immune response. The analysis includes data processing, statistical tests and visualization of key findings.
+
+# Input:
+"data/feature-table.tsv"
+"data/ehomd-taxonomy.qza"
+"data/tree.nwk"
+"data/metadada.csv"
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries needed
+
+```{r setup, include=FALSE}
+library(qiime2R)
+library(phyloseq)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(decontam)
+library(biomformat)
+library(readr)
+library(grid)
+library(gridExtra)
+library(vegan)
+library(pairwiseAdonis)
+library(btools)
+library(speedyseq)
+library(cowplot)
+library(NBZIMM)
+library(nlme)
+```
+
+## Ingredient No. 1: OTU table
+
+```{r load and prepare feature table}
+# Load feature table
+feature_table <- read.table(file = "feature-table.tsv", sep = "\t", header = T, row.names = NULL, 
+                  skip = 1, comment.char = "", check.names = FALSE) 
+head(feature_table)
+
+# convert #OTU ID column into rownames
+feature_table2 <- feature_table[,-1]
+rownames(feature_table2) <- feature_table[,1]
+head(feature_table2)
+
+# Convert df to matrix
+otu_mat <- as.matrix(feature_table2)
+head(otu_mat)
+```
+
+## Ingredient No. 2: Taxa table
+
+```{r load and prepare TAXA}
+taxonomy <- read_qza("ehomd-taxonomy.qza")
+taxonomy <- parse_taxonomy(taxonomy$data)
+head(taxonomy)
+tax.clean <- data.frame(row.names = row.names(taxonomy),
+                        Kingdom = str_replace(taxonomy[,1], "d__",""),
+                        Phylum = str_replace(taxonomy[,2], "p__",""),
+                        Class = str_replace(taxonomy[,3], "c__",""),
+                        Order = str_replace(taxonomy[,4], "o__",""),
+                        Family = str_replace(taxonomy[,5], "f__",""),
+                        Genus = str_replace(taxonomy[,6], "g__",""),
+                        Species = str_replace(taxonomy[,7], "s__",""),
+                        stringsAsFactors = FALSE)
+
+tax.clean[is.na(tax.clean)] <- ""
+tax.clean[tax.clean=="__"] <- ""
+
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,7] != ""){
+    tax.clean$Species[i] <- paste(tax.clean$Genus[i], tax.clean$Species[i], sep = " ")
+  } else if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified", tax.clean[i,1], sep = " ")
+    tax.clean[i, 2:7] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified", tax.clean[i,2], sep = " ")
+    tax.clean[i, 3:7] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified", tax.clean[i,3], sep = " ")
+    tax.clean[i, 4:7] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified", tax.clean[i,4], sep = " ")
+    tax.clean[i, 5:7] <- order
+  } else if (tax.clean[i,6] == ""){
+    family <- paste("Unclassified", tax.clean[i,5], sep = " ")
+    tax.clean[i, 6:7] <- family
+  } else if (tax.clean[i,7] == ""){
+    tax.clean$Species[i] <- paste("Unclassified ",tax.clean$Genus[i], sep ="")
+ }
+}
+
+
+head(tax.clean)
+
+# Convert df into matrix
+tax.clean <- as.matrix(tax.clean)
+head(tax.clean)
+
+```
+
+## Ingredient No. 3: Metadata
+
+```{r load and prepare META}
+metadata <- read_csv("metadata.csv")
+head(metadata)
+
+# Convert the SampleID column (id2) into rownames 
+metadata2 <-as.matrix(metadata[,-1])  
+rownames(metadata2) <- as.matrix(metadata[,1]) 
+head(metadata2)
+metadata2 <- as.data.frame(metadata2) 
+
+meta <- metadata2 
+```
+
+## Build Phyloseq object
+
+```{r}
+OTU = otu_table(otu_mat, taxa_are_rows = TRUE)
+head(OTU)
+
+TAX = tax_table(tax.clean)
+head(TAX)
+
+META <- sample_data(meta)
+head(META)
+
+TREE = read_tree("tree.nwk")
+TREE
+
+ps <- phyloseq(OTU, TAX, META, TREE)
+ps
+
+saveRDS(ps, file = "raw_ps.rds")
+ps <- readRDS("raw_ps.rds")
+```
+
+## Decontam - ps with 10 negative controls (3 mock samples + 7 extraction controls)
+
+```{r inspect library size}
+
+df2 <- as.data.frame(sample_data(ps))
+df2$sample_type[df2$sample_type %in% c("mock_sputum", "extraction")] <- "negative_control"
+sample_data(ps) <- sample_data(df2)
+
+df2$librarySize <- sample_sums(ps) 
+df2 <- df2[order(df2$librarySize),]
+df2$Index <- seq(nrow(df2))
+ggplot(data=df2, aes(x=Index, y=librarySize, color=sample_type))+
+  geom_point()
+```
+
+```{r}
+ps.ord <- ordinate(ps, "PCoA", "bray") 
+
+empty_samples <- sample_sums(ps) == 0
+names(which(empty_samples))
+ps <- prune_samples(sample_sums(ps) > 0, ps)
+
+ps.ord <- ordinate(ps, "PCoA", "bray") 
+plot_ordination(ps, ps.ord, type="samples", color="sample_type")
+
+```
+
+```{r identify contaminants - Prevalence method}
+sample_data(ps)$is.neg <- sample_data(ps)$sample_type == "negative_control" 
+
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="is.neg") 
+table(contamdf.prev$contaminant)
+
+contam_true_rows <- contamdf.prev[contamdf.prev$contaminant == TRUE, ]
+contam_true_rows
+```
+
+```{r number of times several taxa were observed in negative controls and samples}
+# Make a phyloseq object of presence-absence (pa) in neg controls and true samples
+ps.pa <- transform_sample_counts(ps, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$sample_type == "negative_control", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$sample_type == "sputum", ps.pa)
+
+## Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev$contaminant)
+
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) +
+  geom_point() +
+  xlab("Prevalence (Negative Controls)") + 
+  ylab("Prevalence (Sputum)")
+
+```
+
+```{r name contaminant taxa}
+row_indices <- which(contamdf.prev$contaminant) 
+
+taxonomy_table <- tibble()
+
+for (i in row_indices){
+  loc <- contamdf.prev[i, 0]
+  tax_key <- row.names(loc)
+  tax_value <- taxonomy[tax_key, ] 
+  taxonomy_table <- rbind(taxonomy_table, tax_value)
+}
+
+taxonomy_table
+```
+
+```{r median relative abundance and prevalence of contaminants in true sputum samples}
+# Extract taxa identified as contaminants
+contaminant_taxa <- rownames(contamdf.prev)[contamdf.prev$contaminant]
+
+# Step 2: Calculate mean relative abundance for contaminants
+# Transform counts to relative abundance
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x)*100)
+
+# Subset to contaminants only
+ps_contaminants <- prune_taxa(contaminant_taxa, ps_rel)
+
+# Aggregate relative abundance by SampleType
+abundance_summary <- ps_contaminants %>%
+  psmelt() %>%
+  group_by(OTU, sample_type) %>%
+  summarize(MeanRelativeAbundance = mean(Abundance, na.rm = TRUE),
+            MeanPrevalence = mean(Abundance > 0, na.rm = TRUE)) %>%
+  pivot_wider(names_from = sample_type, 
+              values_from = c(MeanRelativeAbundance, MeanPrevalence),
+              values_fill = 0)
+abundance_summary
+```
+
+```{r prune contaminant taxa}
+ps_10controls_01 <- prune_taxa(!contamdf.prev$contaminant, ps)
+ps_10controls_01
+saveRDS(ps_10controls_01, file = "ps_10controls_01.rds")
+
+```
+
+## Alpha diversity analysis
+```{r shannon}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+shannon_df <- estimate_richness(ps, measures = "Shannon")
+m <- as.data.frame(ps@sam_data) 
+
+# Merge Shannon with meta
+shannon_metadata <- merge(m, shannon_df, by = NULL, by.x = "row.names", by.y = "row.names", all = TRUE)
+
+# Assess normality: QQ-plot
+shannon_metadata$time <- factor(shannon_metadata$time, levels = c("train", "post", "fu"))
+
+png("qq_plots/shannon_qq.png", width = 6, height = 4, units = "in", res = 300)
+
+par(mfrow = c(1, 3))
+for (t in levels(shannon_metadata$time)) {
+  subset <- shannon_metadata$Shannon[shannon_metadata$time == t]
+  plot_title <- switch(t,
+                       "train" = "Shannon: Pre-Exposure",
+                       "post" = "6h Post-Exposure",
+                       "fu" = "24h Post-Exposure")
+  qqnorm(subset, main = plot_title)
+  qqline(subset, col = "red")
+}
+
+
+dev.off()
+```
+
+```{r Shannon stats}
+# STATS: Repeated measures one-way ANOVA
+res.aov <- anova_test(data = shannon_metadata, dv=Shannon,
+                      wid=subject,
+                      within = time)
+get_anova_table(res.aov) # ns
+
+# STATS: Repeated measures two-way ANOVA
+res.aov <- anova_test(
+  data = shannon_metadata, 
+  dv = Shannon,
+  wid = subject,
+  within = time,
+  between = sex
+  )
+get_anova_table(res.aov) # sex:time *
+
+# EFFECT OF SEX 
+pwc <- shannon_metadata %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    Shannon ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+
+# EFFECT OF TIME
+pwc2 <- shannon_metadata %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    Shannon ~ time, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+```
+
+
+
+```{r Shannon diversity plots}
+ps@sam_data$time <- ordered(ps@sam_data$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+p1 <- ggplot(data = shannon_metadata, 
+       aes(x = time, y = Shannon, group = subject)) +
+  geom_point(size = 3) +              
+  geom_line(alpha = 0.6) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Shannon Diversity") +                    
+  xlab(NULL) +                              
+  theme_minimal() 
+
+p1
+```
+
+```{r Faith diversity}
+pd <- estimate_pd(ps)
+
+# Merge PD with meta
+pd_metadata <- merge(m, pd, by = NULL, by.x = "row.names", by.y = "row.names", all = TRUE)
+
+# Assess normality: QQ-plot
+pd_metadata$time <- factor(pd_metadata$time, levels = c("train", "post", "fu"))
+
+png("qq_plots/faith_qq.png", width = 6, height = 4, units = "in", res = 300)
+
+par(mfrow = c(1, 3))
+for (t in levels(pd_metadata$time)) {
+  subset <- pd_metadata$PD[pd_metadata$time == t]
+  plot_title <- switch(t,
+                       "train" = "Faith PD: Pre-Exposure",
+                       "post" = "6h Post-Exposure",
+                       "fu" = "24h Post-Exposure")
+  qqnorm(subset, main = plot_title)
+  qqline(subset, col = "red")
+}
+
+dev.off()
+```
+
+```{r Faith diversity stats}
+# STATS: Repeated measures one-way ANOVA
+res.aov <- anova_test(data = pd_metadata, dv=PD,
+                      wid=subject,
+                      within = time)
+get_anova_table(res.aov) # ns
+
+# STATS: Repeated measures two-way ANOVA
+res.aov <- anova_test(
+  data = pd_metadata, 
+  dv = PD,
+  wid = subject,
+  within = time,
+  between = sex
+  )
+get_anova_table(res.aov) #ns
+```
+
+
+```{r Faith diversity plot}
+ps@sam_data$time <- ordered(ps@sam_data$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+p2 <- ggplot(data = pd_metadata, 
+       aes(x = time, y = PD, group = subject)) +
+  geom_point(size = 3) +              
+  geom_line(alpha = 0.6) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Faith's Phylogenetic Diversity") +                    
+  xlab(NULL) +                              
+  theme_minimal() 
+
+p2
+```
+
+## Alpha diversity by sex
+```{r Shannon by sex}
+ps@sam_data$time <- ordered(ps@sam_data$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+p3 <- ggboxplot(shannon_metadata, x = "time", y = "Shannon", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Shannon Diversity",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())
+
+p3
+```
+```{r FaithPD by sex}
+ps@sam_data$time <- ordered(ps@sam_data$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+p4 <- ggboxplot(pd_metadata, x = "time", y = "PD", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Faith's Phylogenetic Diversity",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())
+
+p4
+```
+```{r combine alpha bySex}
+combined <- grid.arrange(p3, p4, ncol = 2)
+
+png("clinical_supp_figures/alpha_bySex.png", width = 13, height = 4, units = "in", res = 300)
+grid.draw(combined)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+
+## Beta diversity
+
+```{r Bray-Curtis and PERMANOVA}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+m <- data.frame(sample_data(ps))
+
+dist = phyloseq::distance(ps, method="bray") 
+ordination = ordinate(ps, method="PCoA", distance=dist) 
+
+test.adonis <- adonis2(dist ~ time, 
+                      data = m,
+                      permutations = 999,
+                      strata = m$subject)
+test.adonis
+
+
+adonis_bySex <- adonis2(dist ~ time * sex, 
+                       data = m, 
+                       permutations = 999, 
+                       strata = m$subject)
+adonis_bySex
+```
+```{r Pairwise Adonis test}
+# Perform pairwise Adonis test
+pairwise_results <- pairwise.adonis2(
+  dist~ time,                     
+  data = m,         
+  strata = 'subject')
+
+# View results
+print(pairwise_results)
+```
+
+```{r pairwise with adonis2 - same as above, different method}
+timepoints <- c("train", "post","fu")  
+
+# Create an empty list to store results
+adonis_results <- list()
+
+# Loop through each pair of timepoints
+for(i in 1:(length(timepoints) - 1)) {
+  for(j in (i + 1):length(timepoints)) {
+    # Subset the metadata for the current pair of timepoints
+    subset_metadata <- m[m$time %in% c(timepoints[i], timepoints[j]), ]
+    
+    # Subset the phyloseq data for the current pair of timepoints
+    pair_data <- subset_samples(ps, time %in% c(timepoints[i], timepoints[j]))
+    
+    # Check if the number of samples matches
+    if (nsamples(pair_data) == nrow(subset_metadata)) {
+      # Calculate Bray-Curtis distance for the subset data
+      dist_pair <- phyloseq::distance(pair_data, method = "bray")
+      
+      # Run adonis2 with repeated measures (strata argument)
+      adonis_result <- adonis2(dist_pair ~ time, data = subset_metadata, permutations = 999, strata = subset_metadata$subject)
+      
+      # Store the result with a label for the pair of time points
+      adonis_results[[paste(timepoints[i], "vs", timepoints[j])]] <- adonis_result
+    } else {
+      warning(paste("Number of samples mismatch for", timepoints[i], "vs", timepoints[j]))
+    }
+  }
+}
+
+# View results for each pairwise comparison
+adonis_results
+
+```
+
+```{r PCoA}
+ps@sam_data$time <- ordered(ps@sam_data$time,
+                             levels = c("train", "post", "fu"))
+levels(ps@sam_data$time)
+
+time_colors <- c("lightblue", "maroon", "olivedrab")
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+
+p3 <- plot_ordination(ps, ordination, color="time") + # Visualize Ordination
+  theme_classic() +
+  scale_color_manual(values = time_colors, labels = new_labels) +
+  theme(strip.background = element_blank()) +
+  stat_ellipse()
+
+p3
+```
+
+```{r combine alpha and beta diversity plots}
+combined_plot <- grid.arrange(p1, p2, p3, ncol = 2)
+
+png("alpha_beta_plot.png", width = 13, height = 8, units = "in", res = 300)
+grid.draw(combined_plot)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.96, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.96, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.01, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+```{r paired visualization}
+# Extract ordination data as a data frame
+ordination_df <- plot_ordination(ps, ordination, justDF = TRUE)
+
+ordination_df$time <- sample_data(ps)$time
+ordination_df$SubjectID <- sample_data(ps)$subject
+
+# Verify levels in the time column (if needed, convert to factor)
+ordination_df$time <- factor(ordination_df$time, levels = c("train", "post", "fu"))
+
+
+#Visualize ordination with paired samples connected
+ordination_df$time <- ordered(ordination_df$time,
+                             levels = c("train", "post", "fu"))
+levels(ordination_df$time)
+
+time_colors <- c("lightblue", "maroon", "olivedrab")
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+
+p <- ggplot(ordination_df, aes(x = Axis.1, y = Axis.2, color = time, group = subject)) +
+  geom_point(size = 3) +  # Add points for each sample
+  geom_line(aes(group = subject), alpha = 0.5, color = "gray") +  # Add lines for paired samples
+  theme_classic() +
+  scale_color_manual(values = time_colors, labels = new_labels) +
+  theme(strip.background = element_blank()) 
+
+ggsave("aggregate_pairwise.png", plot = p, width = 8, height = 4, dpi = 300)
+```
+
+```{r train vs post}
+# Define the time points to include in the plot
+timepoints <- c("train", "post")  # Specify the two time points you want to compare
+
+# Subset the phyloseq object to include only the specified time points
+subset_ps <- subset_samples(ps, time %in% timepoints)
+
+# Calculate Bray-Curtis distance
+dist_matrix <- phyloseq::distance(subset_ps, method = "bray")
+
+# Perform PCoA
+ordination <- ordinate(subset_ps, method = "PCoA", distance = dist_matrix)
+
+# Extract PCoA coordinates into a data frame
+ordination_df <- as.data.frame(ordination$vectors)
+ordination_df$time <- sample_data(subset_ps)$time  # Add timepoint info
+ordination_df$subject <- sample_data(subset_ps)$subject  # Add subject info for pairing
+
+# Create the plot
+ordination_df$time <- ordered(ordination_df$time,
+                             levels = c("train", "post"))
+levels(ordination_df$time)
+
+new_labels <- c("Pre-exposure", "6h post-exposure")
+
+p1 <- ggplot(ordination_df, aes(x = Axis.1, y = Axis.2, color = time)) +
+  geom_point(size = 4) +  # Plot points
+  geom_line(aes(group = subject), color = "grey") +  # Connect points for the same subject
+  scale_color_manual(values = c("train" = "lightblue", "post" = "maroon"), labels = new_labels) +  # Custom colors
+  labs(x = "PCoA1", y = "PCoA2") +
+  theme_classic() +
+  theme(legend.position = "top")
+
+# Display the plot
+print(p1)
+```
+
+```{r train vs fu}
+# Define the time points to include in the plot
+timepoints <- c("train", "fu")  # Specify the two time points you want to compare
+
+# Subset the phyloseq object to include only the specified time points
+subset_ps <- subset_samples(ps, time %in% timepoints)
+
+# Calculate Bray-Curtis distance
+dist_matrix <- phyloseq::distance(subset_ps, method = "bray")
+
+# Perform PCoA
+ordination <- ordinate(subset_ps, method = "PCoA", distance = dist_matrix)
+
+# Extract PCoA coordinates into a data frame
+ordination_df <- as.data.frame(ordination$vectors)
+ordination_df$time <- sample_data(subset_ps)$time  # Add timepoint info
+ordination_df$subject <- sample_data(subset_ps)$subject  # Add subject info for pairing
+
+# Create the plot
+ordination_df$time <- ordered(ordination_df$time,
+                             levels = c("train", "fu"))
+levels(ordination_df$time)
+
+new_labels <- c("Pre-exposure", "24h post-exposure")
+
+p2 <- ggplot(ordination_df, aes(x = Axis.1, y = Axis.2, color = time)) +
+  geom_point(size = 4) +  # Plot points
+  geom_line(aes(group = subject), color = "grey") +  # Connect points for the same subject
+  scale_color_manual(values = c("train" = "lightblue", "fu" = "olivedrab"), labels = new_labels) +  # Custom colors
+  labs(x = "PCoA1", y = "PCoA2") +
+  theme_classic() +
+  theme(legend.position = "top")
+
+# Display the plot
+print(p2)
+
+```
+
+```{r post vs fu}
+# Define the time points to include in the plot
+timepoints <- c("post", "fu")  # Specify the two time points you want to compare
+
+# Subset the phyloseq object to include only the specified time points
+subset_ps <- subset_samples(ps, time %in% timepoints)
+
+# Calculate Bray-Curtis distance
+dist_matrix <- phyloseq::distance(subset_ps, method = "bray")
+
+# Perform PCoA
+ordination <- ordinate(subset_ps, method = "PCoA", distance = dist_matrix)
+
+# Extract PCoA coordinates into a data frame
+ordination_df <- as.data.frame(ordination$vectors)
+ordination_df$time <- sample_data(subset_ps)$time  
+ordination_df$subject <- sample_data(subset_ps)$subject  
+
+# Create the plot
+ordination_df$time <- ordered(ordination_df$time,
+                             levels = c("post", "fu"))
+levels(ordination_df$time)
+
+new_labels <- c("6h post-exposure", "24h post-exposure")
+
+p3 <- ggplot(ordination_df, aes(x = Axis.1, y = Axis.2, color = time)) +
+  geom_point(size = 4) +  # Plot points
+  geom_line(aes(group = subject), color = "grey") +  
+  scale_color_manual(values = c("post" = "maroon", "fu" = "olivedrab"), labels = new_labels) +  # Custom colors
+  labs(x = "PCoA1", y = "PCoA2") +
+  theme_classic() 
+
+# Display the plot
+print(p3)
+```
+
+```{r combine pairwise beta diversity plots}
+combined_plot <- grid.arrange(p1, p2, p3, ncol = 3)
+
+png("pairwise_beta_plot.png", width = 20, height = 6, units = "in", res = 300)
+grid.draw(combined_plot)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.96, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.35, "npc"), y = unit(0.96, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.65, "npc"), y = unit(0.96, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+## Relative abundance plots - Microshade
+
+```{r Microshade - prepare data}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+# Use microshades function prep_mdf to agglomerate, normalize, and melt the phyloseq object
+mdf_prep <- prep_mdf(ps, subgroup_level = "Genus")
+
+# Create a color object for the specified data
+color_objs_sputum <- create_color_dfs(mdf_prep, group_level = "Phylum", selected_groups = c('Fusobacteria', 'Proteobacteria', 'Actinobacteria', 'Bacteroidetes', 'Firmicutes'), subgroup_level = "Genus", cvd = TRUE) 
+
+# Extract
+mdf_sputum_unordered <- color_objs_sputum$mdf # this contains sample data and abundance info
+cdf_sputum <- color_objs_sputum$cdf #this stores the color mapping info used for plotting
+
+aggregate(Abundance ~ time, data = mdf_sputum_unordered, sum)
+# Normalize Abundance so it sums to 1 for each timepoint
+mdf_sputum_unordered <- mdf_sputum_unordered %>%
+  group_by(time) %>%
+  mutate(Abundance = Abundance / sum(Abundance)) %>% 
+  ungroup()
+
+mdf_sputum_unordered <- as.data.frame(mdf_sputum_unordered)
+cdf_sputum <- as.data.frame(cdf_sputum)
+```
+
+```{r Microshade: Aggregated by time Relative abundance plot}
+mdf_sputum_unordered$time <- ordered(mdf_sputum_unordered$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+p <- plot_microshades(mdf_sputum_unordered, 
+                           cdf_sputum,
+                           x = "time",
+                           y = "Abundance") +
+  theme_classic()+
+  scale_x_discrete(labels = new_labels)+
+  scale_y_continuous(labels = scales::percent, expand = expansion(0))+
+  labs(x=NULL, 
+       y="Relative abundance")+
+  theme(legend.position = "none")
+
+p
+
+# Customize legend
+GP_legend <-custom_legend(mdf_sputum_unordered, cdf_sputum)
+
+p1 <- plot_grid(p, 
+          GP_legend, 
+          rel_widths = c(1, 0.25))
+
+ggsave("rel ab per time.png", plot = p1, width = 10, height = 6, dpi = 300,
+       bg = "white")
+```
+
+```{r Microshade: Relative abundance per subject}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+# Use microshades function prep_mdf to agglomerate, normalize, and melt the phyloseq object
+mdf_prep <- prep_mdf(ps, subgroup_level = "Genus")
+
+# Create a color object for the specified data
+color_objs_sputum <- create_color_dfs(mdf_prep, group_level = "Phylum", selected_groups = c('Fusobacteria', 'Proteobacteria', 'Actinobacteria', 'Bacteroidetes', 'Firmicutes'), subgroup_level = "Genus", cvd = TRUE) 
+
+# Extract
+mdf_sputum_unordered <- color_objs_sputum$mdf 
+cdf_sputum <- color_objs_sputum$cdf 
+
+#Plot
+
+mdf_sputum_unordered$time <- ordered(mdf_sputum_unordered$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+time_labels <- setNames(new_labels, c("train", "post", "fu"))
+
+plot_1 <- plot_microshades(mdf_sputum_unordered, 
+                           cdf_sputum)
+
+GP_legend <-custom_legend(mdf_sputum_unordered, cdf_sputum)
+
+plot_diff <- plot_1 + scale_y_continuous(labels = scales::percent, expand = expansion(0)) +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(size= 6)) +
+  labs(x=NULL, 
+       y="Relative abundance") +
+  theme_classic()+ 
+  theme(axis.text.x.bottom = element_text(angle = 45, vjust = 0.5,
+                                          size = 5)) +
+  theme(legend.position = "none") +
+  facet_wrap(~time, scales = "free_x", nrow = 1,
+             labeller = labeller(time = time_labels))
+
+plot_diff
+
+p2 <- plot_grid(plot_diff, 
+                GP_legend, rel_widths = c(1, .25))
+
+p2
+
+ggsave("rel ab per subject.png", plot = p2, width = 10, height = 6, dpi = 300,
+       bg = "white")
+
+```
+
+## Relative abundance plots
+
+```{r Phylum level}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+ps_sputum_rel = transform_sample_counts(ps, function(x) x/sum(x)*100)
+
+# agglomerate taxa
+glom <- tax_glom(ps_sputum_rel, taxrank = 'Phylum', NArm = FALSE) 
+ps.melt <- psmelt(glom)
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+
+
+ps.melt <- ps.melt %>%
+  group_by(time, Phylum) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 1
+keep <- unique(ps.melt$Phylum[ps.melt$median > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "< 1%" # 
+
+
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,time,Phylum) %>% 
+  summarise(Abundance=sum(Abundance))
+
+#Plot prep
+ps.melt_sum$time <- ordered(ps.melt_sum$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+## Order from most to least abundant Phyla
+ps.melt_sum$Phylum <- factor(ps.melt_sum$Phylum, levels = unique(ps.melt_sum$Phylum[order(ps.melt_sum$Abundance)]))
+
+```
+
+```{r plot at Phylum level}
+ps.melt_sum$time <- factor(ps.melt_sum$time,
+                             levels = c("fu", "post", "train"))
+
+p3 <- ggplot(ps.melt_sum, aes(y = Phylum, x = Abundance, color = time)) +
+  stat_summary(fun.data = median_hilow, geom = "pointrange", 
+               fun.args = list(conf.int = 0.5),
+               position = position_dodge(width = 0.6)
+               ) +
+  scale_color_manual(name=NULL,
+                   breaks=c("train",
+                            "post",
+                            "fu"),
+                   labels=c("Pre-Exposure",
+                            "6h Post-Exposure",
+                            "24h Post-Exposure"),
+                   values=c("gray", "blue", "red")) +
+    labs(y=NULL,
+       x="Relative Abundance (%)") +
+  theme_classic() +
+  theme(axis.text.y = element_markdown(),
+        legend.text = element_markdown(),
+        legend.position = c(0.85, 0.2),
+        legend.background = element_rect(color="black", fill = NA),
+        legend.margin = margin(t=-5, r=3, b=3)
+        )
+
+p3
+```
+
+```{r Genus level}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+ps_sputum_rel = transform_sample_counts(ps, function(x) x/sum(x)*100)
+
+# agglomerate taxa
+glom <- tax_glom(ps_sputum_rel, taxrank = 'Genus', NArm = FALSE) 
+ps.melt <- psmelt(glom)
+ps.melt$Genus <- as.character(ps.melt$Genus)
+
+
+ps.melt <- ps.melt %>%
+  group_by(time, Genus) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 1
+keep <- unique(ps.melt$Genus[ps.melt$median > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "< 1%" # 
+
+
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,time,Genus) %>% 
+  summarise(Abundance=sum(Abundance))
+
+#Plot prep
+ps.melt_sum$time <- ordered(ps.melt_sum$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+## Order from most to least abundant Phyla
+ps.melt_sum$Genus <- factor(ps.melt_sum$Genus, levels = unique(ps.melt_sum$Genus[order(ps.melt_sum$Abundance)]))
+```
+
+```{r Plot at genus level}
+ps.melt_sum$time <- factor(ps.melt_sum$time,
+                             levels = c("fu", "post", "train"))
+
+p4 <- ggplot(ps.melt_sum, aes(y = Genus, x = Abundance, color = time)) +
+  stat_summary(fun.data = median_hilow, geom = "pointrange", 
+               fun.args = list(conf.int = 0.5),
+               position = position_dodge(width = 0.6)
+               ) +
+  scale_color_manual(name=NULL,
+                   breaks=c("train",
+                            "post",
+                            "fu"),
+                   labels=c("Pre-Exposure",
+                            "6h Post-Exposure",
+                            "24h Post-Exposure"),
+                   values=c("gray", "blue", "red")) +
+    labs(y=NULL,
+       x="Relative Abundance (%)") +
+  theme_classic() +
+  theme(axis.text.y = element_markdown(),
+        legend.position = "none")
+
+p4
+```
+
+```{r Species level}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps) #only include sputum sample data
+
+ps_sputum_rel = transform_sample_counts(ps, function(x) x/sum(x)*100)
+
+# agglomerate taxa
+glom <- tax_glom(ps_sputum_rel, taxrank = 'Species', NArm = FALSE) 
+ps.melt <- psmelt(glom)
+ps.melt$Species <- as.character(ps.melt$Species)
+
+
+ps.melt <- ps.melt %>%
+  group_by(time, Species) %>%
+  mutate(median=median(Abundance))
+
+# select group median > 1
+keep <- unique(ps.melt$Species[ps.melt$median > 1])
+ps.melt$Species[!(ps.melt$Species %in% keep)] <- "< 1%" # 
+
+
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,time,Species) %>% 
+  summarise(Abundance=sum(Abundance))
+
+#Plot prep
+ps.melt_sum$time <- ordered(ps.melt_sum$time,
+                             levels = c("train", "post", "fu"))
+
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+
+## Order from most to least abundant Phyla
+ps.melt_sum$Species <- factor(ps.melt_sum$Species, levels = unique(ps.melt_sum$Species[order(ps.melt_sum$Abundance)]))
+```
+
+```{r plot at species level}
+ps.melt_sum$time <- factor(ps.melt_sum$time,
+                             levels = c("fu", "post", "train"))
+
+p5 <- ggplot(ps.melt_sum, aes(y = Species, x = Abundance, color = time)) +
+  stat_summary(fun.data = median_hilow, geom = "pointrange", 
+               fun.args = list(conf.int = 0.5),
+               position = position_dodge(width = 0.6)
+               ) +
+  scale_color_manual(name=NULL,
+                   breaks=c("train",
+                            "post",
+                            "fu"),
+                   labels=c("Pre-Exposure",
+                            "6h Post-Exposure",
+                            "24h Post-Exposure"),
+                   values=c("gray", "blue", "red")) +
+    labs(y=NULL,
+       x="Relative Abundance (%)") +
+  theme_classic() +
+  theme(axis.text.y = element_markdown(),
+        legend.position = "none"
+        )
+
+p5
+```
+
+```{r combine relative abundance plots}
+
+combined_plot <- grid.arrange(p3, p4, p5, ncol = 3)
+
+combined_plot
+
+
+png("relative_abundance_grouped_3plots.png", width = 20, height = 4, units = "in", res = 300)
+grid.draw(combined_plot)
+grid.text("B", x = unit(0.01, "npc"), y = unit(0.98, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.35, "npc"), y = unit(0.98, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.7, "npc"), y = unit(0.98, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+```{r}
+final_plot <- grid.arrange(
+  arrangeGrob(p2,widths = 1), 
+  combined_plot, 
+  ncol = 1,  # Arrange in one column
+  heights = c(2, 2) # Adjust heights of rows if needed
+)
+# Save the final combined plot
+png("all relative abundance plots.png", width = 25, height = 12, units = "in", res = 300)
+grid.draw(final_plot)
+grid.text("A", x = unit(0.004, "npc"), y = unit(0.98, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.004, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.35, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.7, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+dev.off()
+```
+
+## Differential abundance - Genus
+
+```{r Genus level - prepare input data}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps)
+
+# Extract OTU and taxa tables from the phyloseq object 
+otu_table <- otu_table(ps)
+taxa_table <- tax_table(ps)
+
+# Prepare input data
+table_data <- as.data.frame(otu_table) 
+# convert rownames to column
+table_data$otu <- rownames(table_data)
+
+# Get the Genus level taxa names
+taxa_table <- as.data.frame(taxa_table)
+genus_taxa_table <- data.frame(otu = rownames(taxa_table), Genus = taxa_table$Genus)
+
+# Merge table_data and genus_taxa_table
+input_data <- merge(genus_taxa_table, table_data, 
+                    by = "otu",
+                    all.x = T) 
+
+# Transpose input_data 
+input_data <- input_data[,2:163] 
+input_data_sum <- input_data %>% 
+  group_by(Genus) %>% 
+  summarize_all(sum)
+transposed_input_data <- t(input_data_sum) 
+colnames(transposed_input_data) <- unname(transposed_input_data[1, ])
+transposed_input_data <- transposed_input_data[-1, ]
+id2 <- rownames(transposed_input_data)
+transposed_input_data <- cbind(id2, transposed_input_data)
+row.names(transposed_input_data) <- NULL 
+
+write.table(transposed_input_data, 
+            sep = "\t",
+            file = "genus_inputData",
+            row.names = FALSE)
+```
+
+```{r Genus - Read input files}
+otu <- read_tsv("genus_inputData")
+
+sample_data <- sample_data(ps)
+input_metadata <- sample_data
+
+write.table(input_metadata, 
+            sep = "\t",
+            file = "input_metadata",
+            row.names = FALSE)
+
+sam <- read_tsv("input_metadata")
+```
+
+```{r Genus - prep input data}
+
+names(sam)[names(sam) == "time"] <- "timept"
+sam$time <- ifelse(sam$timept == "train", 0,
+                   ifelse(sam$timept == "post", 1,
+                          ifelse(sam$timept == "fu", 2, NA)))
+
+otu <- as.data.frame(otu)
+rownames(otu) <- otu[, 1]  
+otu <- otu[, -1] 
+otu <- otu %>% 
+  mutate_if(is.numeric, as.integer)
+
+# add the readcount column to sam
+otu$readcount <- rowSums(otu[, -1]) 
+sam <- cbind(sam, readcount = otu$readcount) 
+otu <- otu[, !names(otu) %in% c("readcount")] 
+sam$readcount <- as.integer(sam$readcount) 
+sam$log_N <- log(sam$readcount) 
+
+N = sam$readcount
+sc.time = scale(sam$time)
+sc.sex = sam$sex
+race = sam$race 
+asthma = sam$asthmatic
+bmi = sam$bmi
+age = sam$age
+pmn.abs = sam$sputum_pmn_cells.mg
+mac.abs = sam$sputum_macs_cells.mg
+```
+
+```{r Genus - Differential abundance}
+f2 = mms(y = otu, fixed = ~  sc.time + sc.sex + bmi + age + asthma +race,
+         random = ~ 1 | subject, data = sam,
+         min.p = 0.2, method = "nb")
+
+summary(f2)
+
+padj.vals <- fixed.mms(f2)[[1]][6];
+write.table(padj.vals,"qvals.txt",sep="\t")
+
+p.vals <- fixed.mms(f2)[[1]][5];
+write.table(p.vals,"pvals.txt",sep="\t")
+
+fits <- fixed.mms(f2)[[1]];
+write.table(fits,"fits.txt",sep="\t")
+
+
+out = fixed.mms(f2)$dist
+out = out[out[,2]!="(Intercept)", ] 
+res = out[, 3:6]
+res = res[(res$padj < 0.05),]
+ordered_res <- res[order(res$Estimate), ]
+ordered_res
+
+rownames(ordered_res) <- gsub("--sc.time$", "", rownames(ordered_res))
+ordered_res
+#dir.create("DiffAb_Genus")
+
+#saveRDS(ordered_res, file = "DiffAb_Genus/genus.rds")
+ordered_res <- readRDS("diff_genus.rds")
+
+#saveRDS(ordered_res, file = "DiffAb_Genus/genus_race.rds")
+ordered_res <- readRDS("DiffAb_Genus/genus_race.rds")
+```
+
+```{r Genus - differential abundance plot}
+par(mfrow = c(1,1), cex.axis = 1, mar = c(5, 15, 2, 4)) 
+plot.fixed(res = ordered_res, threshold = 0.05, gap = 500,
+           cex.axis = 1, cex.var = 1, show.all.vars = F)
+
+p1 <- recordPlot()
+p1
+
+png(filename = "DiffAb_Genus/genus_race.png", width = 7, height = 10, units = "in", res = 300)
+replayPlot(p1)
+dev.off()
+```
+
+## Host-Microbiome - Genus
+
+```{r Prepare data}
+otu <- read_tsv("genus_inputData")
+sam <- read_tsv("input_metadata")
+
+#Remove subjects with missing macrophage data
+sam <- sam %>%
+  filter(!is.na(sam$sputum_macs_cells.mg) &
+          sputum_macs_cells.mg >0)
+
+sam <- sam %>% 
+  filter(!subject %in% c("28", "70", "72", "75", "79"))
+
+names(sam)[names(sam) == "time"] <- "timept"
+sam$time <- ifelse(sam$timept == "train", 0,
+                   ifelse(sam$timept == "post", 1,
+                          ifelse(sam$timept == "fu", 2, NA)))
+
+otu <- as.data.frame(otu)
+rownames(otu) <- otu[, 1]  
+otu <- otu[, -1] 
+otu <- otu %>% 
+  mutate_if(is.numeric, as.integer)
+# Remove subjects with missing data
+rows_to_remove <- c("28-fu", "28-post", "28-train",
+                    "70-fu", "70-post", "70-train",
+                    "72-fu", "72-post", "72-train",
+                    "75-fu", "75-post", "75-train",
+                    "79-post", "79-train",
+                    "84-fu", "84-post", "84-train")
+otu <- otu[!rownames(otu) %in% rows_to_remove, ]
+
+# add the readcount column to sam
+otu$readcount <- rowSums(otu[, -1]) 
+sam <- cbind(sam, readcount = otu$readcount) 
+otu <- otu[, !names(otu) %in% c("readcount")] 
+sam$readcount <- as.integer(sam$readcount) 
+sam$log_N <- log(sam$readcount) 
+
+N = sam$readcount
+sc.time = scale(sam$time)
+sc.sex = sam$sex
+race = sam$race 
+asthma = sam$asthmatic
+bmi = sam$bmi
+age = sam$age
+pmn.abs = sam$sputum_pmn_cells.mg
+mac.abs = sam$sputum_macs_cells.mg
+```
+
+```{r}
+f2 = mms(y = otu, fixed = ~  sc.time + sc.sex + bmi + age + mac.abs + asthma + race, 
+         random = ~ 1 | subject, data = sam, 
+         min.p = 0.2, method = "nb") 
+
+summary(f2)
+
+padj.vals <- fixed.mms(f2)[[1]][6];
+write.table(padj.vals,"qvals.txt",sep="\t")
+
+p.vals <- fixed.mms(f2)[[1]][5];
+write.table(p.vals,"pvals.txt",sep="\t")
+
+fits <- fixed.mms(f2)[[1]];
+write.table(fits,"fits.txt",sep="\t")
+
+out = fixed.mms(f2)$dist
+#out = out[out[,2]!="(Intercept)", ] #or
+out = out[!out[,2]%in% c("(Intercept)", "sc.time"), ]
+res = out[, 3:6]
+res = res[(res$padj < 0.05),]
+
+ordered_res <- res[order(res$Estimate), ]
+
+rownames(ordered_res) <- gsub("_", " ", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--mac.abs$", " - Macs/mg", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--sc.time$", "-time", rownames(ordered_res))
+ordered_res
+
+#dir.create("hm_Genus")
+
+#saveRDS(ordered_res, file = "hm_Genus/genus_complete.rds")
+ordered_res <- readRDS("hm_Genus/genus_complete.rds")
+
+#saveRDS(ordered_res, file = "hm_Genus/genus_ShowOnlyMacs.rds")
+ordered_res <- readRDS("hm_Genus/genus_ShowOnlyMacs.rds")
+
+#saveRDS(ordered_res, file = "hm_Genus/genus_race_complete.rds")
+ordered_res <- readRDS("hm_Genus/genus_race_complete.rds")
+
+#saveRDS(ordered_res, file = "hm_Genus/genus_race_ShowOnlyMacs.rds")
+ordered_res <- readRDS("hm_Genus/genus_race_ShowOnlyMacs.rds")
+```
+
+```{r Host-microbiome plot -Genus}
+par(mfrow = c(1,1), cex.axis = 1, mar = c(5, 15, 2, 4)) 
+plot.fixed(res = ordered_res, threshold = 0.05, gap = 500,
+           cex.axis = 1, cex.var = 1, show.all.vars = F)
+
+p3 <- recordPlot()
+p3
+
+png(filename = "hm_Genus/genus_race.png", width = 7, height = 10, units = "in", res = 300)
+replayPlot(p3)
+dev.off()
+```
+
+## Differential abundance - Species
+
+```{r Species level - prepare input data}
+ps <- readRDS("ps_10controls_01.rds")
+ps <- prune_samples(ps@sam_data$sample_type == "sputum", ps)
+
+# Extract OTU and taxa tables from the phyloseq object 
+otu_table <- otu_table(ps)
+taxa_table <- tax_table(ps)
+
+# Prepare input data
+table_data <- as.data.frame(otu_table) 
+# convert rownames to column
+table_data$otu <- rownames(table_data)
+
+# Get the Species level taxa names
+taxa_table <- as.data.frame(taxa_table)
+Species_taxa_table <- data.frame(otu = rownames(taxa_table), Species = taxa_table$Species)
+
+# Merge table_data and Species_taxa_table
+input_data <- merge(Species_taxa_table, table_data, 
+                    by = "otu",
+                    all.x = T) 
+
+# Transpose input_data 
+input_data <- input_data[,2:163] 
+input_data_sum <- input_data %>% 
+  group_by(Species) %>% 
+  summarize_all(sum)
+transposed_input_data <- t(input_data_sum) 
+colnames(transposed_input_data) <- unname(transposed_input_data[1, ])
+transposed_input_data <- transposed_input_data[-1, ]
+id2 <- rownames(transposed_input_data)
+transposed_input_data <- cbind(id2, transposed_input_data)
+row.names(transposed_input_data) <- NULL 
+
+write.table(transposed_input_data, 
+            sep = "\t",
+            file = "Species_inputData",
+            row.names = FALSE)
+```
+
+```{r Species - Read input files}
+otu <- read_tsv("Species_inputData")
+
+sample_data <- sample_data(ps)
+input_metadata <- sample_data
+
+write.table(input_metadata, 
+            sep = "\t",
+            file = "input_metadata",
+            row.names = FALSE)
+
+sam <- read_tsv("input_metadata")
+```
+
+```{r Species - prep input data}
+
+names(sam)[names(sam) == "time"] <- "timept"
+sam$time <- ifelse(sam$timept == "train", 0,
+                   ifelse(sam$timept == "post", 1,
+                          ifelse(sam$timept == "fu", 2, NA)))
+
+otu <- as.data.frame(otu)
+rownames(otu) <- otu[, 1]  
+otu <- otu[, -1] 
+otu <- otu %>% 
+  mutate_if(is.numeric, as.integer)
+
+# add the readcount column to sam
+otu$readcount <- rowSums(otu[, -1]) 
+sam <- cbind(sam, readcount = otu$readcount) 
+otu <- otu[, !names(otu) %in% c("readcount")] 
+sam$readcount <- as.integer(sam$readcount) 
+sam$log_N <- log(sam$readcount) 
+
+N = sam$readcount
+sc.time = scale(sam$time)
+sc.sex = sam$sex
+race = sam$race 
+asthma = sam$asthmatic
+bmi = sam$bmi
+age = sam$age
+pmn.abs = sam$sputum_pmn_cells.mg
+mac.abs = sam$sputum_macs_cells.mg
+```
+
+```{r Species - Differential abundance}
+f2 = mms(y = otu, fixed = ~  sc.time + sc.sex + bmi + age + asthma + race,
+         random = ~ 1 | subject, data = sam,
+         min.p = 0.2, method = "nb")
+
+summary(f2)
+
+padj.vals <- fixed.mms(f2)[[1]][6];
+write.table(padj.vals,"qvals.txt",sep="\t")
+
+p.vals <- fixed.mms(f2)[[1]][5];
+write.table(p.vals,"pvals.txt",sep="\t")
+
+fits <- fixed.mms(f2)[[1]];
+write.table(fits,"fits.txt",sep="\t")
+
+
+out = fixed.mms(f2)$dist
+out = out[out[,2]!="(Intercept)", ]
+res = out[, 3:6]
+res = res[(res$padj < 0.05),]
+ordered_res <- res[order(res$Estimate), ]
+ordered_res
+
+rownames(ordered_res) <- gsub("--sc.time$", "", rownames(ordered_res))
+rownames(ordered_res) <- gsub("_", " ", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--bmi$", "-BMI", rownames(ordered_res)) 
+rownames(ordered_res) <- gsub("--age$", "-age", rownames(ordered_res)) 
+
+ordered_res
+
+#saveRDS(ordered_res, file = "diff_sp.rds")
+ordered_res <- readRDS("diff_sp.rds")
+
+
+#saveRDS(ordered_res, file = "DiffAb_Species/diff_sp_race.rds")
+ordered_res <- readRDS("DiffAb_Species/diff_sp_race.rds")
+```
+
+```{r Species - differential abundance plot}
+#dir.create("DiffAb_Species")
+par(mfrow = c(1,1), cex.axis = 1, mar = c(5, 15, 2, 4)) 
+plot.fixed(res = ordered_res, threshold = 0.05, gap = 500,
+           cex.axis = 1, cex.var = 1, show.all.vars = F)
+p2 <- recordPlot()
+p2
+
+png(filename = "DiffAb_Species/species_race.png", width = 7, height = 10, units = "in", res = 300)
+replayPlot(p2)
+dev.off()
+```
+
+```{r Differential abundance figure}
+png(filename = "DiffAb/diff_ab_race.png", width = 20, height = 4, units = "in", res = 300)
+grid.arrange(
+  replayPlot(p1),
+  replayPlot(p2),
+  ncol = 2)
+
+dev.off()
+
+```
+
+## Host-Microbiome - Species
+
+```{r Prepare data}
+otu <- read_tsv("Species_inputData")
+sam <- read_tsv("input_metadata")
+
+#Remove subjects with missing macrophage data
+sam <- sam %>%
+  filter(!is.na(sam$sputum_macs_cells.mg) &
+          sputum_macs_cells.mg >0)
+
+sam <- sam %>% 
+  filter(!subject %in% c("28", "70", "72", "75", "79"))
+
+names(sam)[names(sam) == "time"] <- "timept"
+sam$time <- ifelse(sam$timept == "train", 0,
+                   ifelse(sam$timept == "post", 1,
+                          ifelse(sam$timept == "fu", 2, NA)))
+
+otu <- as.data.frame(otu)
+rownames(otu) <- otu[, 1]  
+otu <- otu[, -1] 
+otu <- otu %>% 
+  mutate_if(is.numeric, as.integer)
+# Remove subjects with missing data
+rows_to_remove <- c("28-fu", "28-post", "28-train",
+                    "70-fu", "70-post", "70-train",
+                    "72-fu", "72-post", "72-train",
+                    "75-fu", "75-post", "75-train",
+                    "79-post", "79-train",
+                    "84-fu", "84-post", "84-train")
+otu <- otu[!rownames(otu) %in% rows_to_remove, ]
+
+# add the readcount column to sam
+otu$readcount <- rowSums(otu[, -1]) 
+sam <- cbind(sam, readcount = otu$readcount) 
+otu <- otu[, !names(otu) %in% c("readcount")] 
+sam$readcount <- as.integer(sam$readcount) 
+sam$log_N <- log(sam$readcount) 
+
+N = sam$readcount
+sc.time = scale(sam$time)
+sc.sex = sam$sex
+race = sam$race 
+asthma = sam$asthmatic
+bmi = sam$bmi
+age = sam$age
+pmn.abs = sam$sputum_pmn_cells.mg
+mac.abs = sam$sputum_macs_cells.mg
+```
+
+```{r}
+f2 = mms(y = otu, fixed = ~  sc.time + sc.sex + bmi + age + mac.abs + asthma + race, 
+         random = ~ 1 | subject, data = sam, 
+         min.p = 0.2, method = "nb") 
+
+summary(f2)
+
+padj.vals <- fixed.mms(f2)[[1]][6];
+write.table(padj.vals,"qvals.txt",sep="\t")
+
+p.vals <- fixed.mms(f2)[[1]][5];
+write.table(p.vals,"pvals.txt",sep="\t")
+
+fits <- fixed.mms(f2)[[1]];
+write.table(fits,"fits.txt",sep="\t")
+
+out = fixed.mms(f2)$dist
+#out = out[out[,2]!="(Intercept)", ] #or
+out = out[!out[,2]%in% c("(Intercept)", "sc.time", "age", "sc.sexMale"), ]
+res = out[, 3:6]
+res = res[(res$padj < 0.05),]
+
+ordered_res <- res[order(res$Estimate), ]
+
+rownames(ordered_res) <- gsub("_", " ", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--mac.abs$", " - Macs/mg", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--sc.time$", "", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--age$", "-age", rownames(ordered_res))
+rownames(ordered_res) <- gsub("--sc.sexMale$", "-sex(male)", rownames(ordered_res))
+ordered_res
+
+#saveRDS(ordered_res, file = "hm_species/species.rds")
+ordered_res <- readRDS("hm_species/species.rds")
+#saveRDS(ordered_res, file = "hm_species/species_race.rds")
+ordered_res <- readRDS("hm_species/species_race.rds")
+
+#saveRDS(ordered_res, file = "hm_species/species_onlyShowMacs.rds")
+ordered_res <- readRDS("hm_species/species_onlyShowMacs.rds")
+#saveRDS(ordered_res, file = "hm_species/species_race_onlyShowMacs.rds")
+ordered_res <- readRDS("hm_species/species_race_onlyShowMacs.rds")
+
+
+
+
+```
+
+```{r}
+#dir.create("hm_species")
+par(mfrow = c(1,1), cex.axis = 1, mar = c(5, 20, 2, 4)) 
+plot.fixed(res = ordered_res, threshold = 0.05, gap = 500,
+           cex.axis = 1, cex.var = 1, show.all.vars = F)
+
+p4 <- recordPlot()
+p4
+
+png(filename = "hm_species/sp_filtered_race.png", width = 7, height = 10, units = "in", res = 300)
+replayPlot(p4)
+dev.off()
+```

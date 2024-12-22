@@ -1,0 +1,900 @@
+---
+title: "Cobos-Uribe et al 2024: Clinical Data Analysis"
+author: "Catalina Cobos-Uribe"
+date: "2024-12-18"
+output: html_document
+---
+
+# Purpose
+This script analyses the inflammatory cell and cytokine data from the study by Cobos-Uribe et al. (2024). This study aimed to investigate the effect of controlled wood smoke exposure on the respiratory microbiome and immune response. The analysis includes data processing, statistical tests and visualization of key findings.
+
+# Input:
+"data/metadada.csv"
+
+#### Load libraries
+```{r libraries, include=FALSE }
+library(rstatix)
+library(ggpubr)
+library(ggplot2)
+library(gridExtra) 
+library(grid)
+library(dplyr)
+library(grid)
+```
+
+#### Prepare data
+```{r}
+data <- read.csv("metadata.csv")
+
+clinical_data <- data %>% 
+  filter(sample_type == "sputum") 
+
+cells <- clinical_data %>%
+  filter(!is.na(clinical_data$sputum_mac_percentage) & !is.na(clinical_data$sputum_PMN_percentage) & !is.na(clinical_data$sputum_macs_cells.mg) & !is.na(clinical_data$sputum_pmn_cells.mg) &
+          sputum_mac_percentage > 0 &
+           sputum_PMN_percentage > 0 &
+           sputum_macs_cells.mg >0 &
+           sputum_pmn_cells.mg > 0)
+
+cells <- cells %>% 
+  filter(!subject %in% c("6", "7", "11",
+                         "28", "70", "72", "75", "79"))
+
+cells <- cells %>% 
+  mutate(
+    log_pmn_mg = log1p(sputum_pmn_cells.mg),
+    log_mac_mg = log1p(sputum_macs_cells.mg),
+    log_total_mg = log1p(sputum._cells.mg)
+  )
+
+cyto <- clinical_data %>%
+  filter(!is.na(clinical_data$sputum_il1b) & !is.na(clinical_data$sputum_il6) & !is.na(clinical_data$sputum_il8) & !is.na(clinical_data$sputum_TNFa) &
+          sputum_il1b > 0 &
+           sputum_il6 > 0 &
+           sputum_il8 >0 &
+           sputum_TNFa > 0)
+
+cyto <- cyto %>% 
+  filter(!subject %in% c("41", "46", "60",
+                         "62"))
+cyto <- cyto %>% 
+  mutate(
+    log_il1b = log1p(sputum_il1b),
+    log_il6 = log1p(sputum_il6),
+    log_il8 = log1p(sputum_il8),
+    log_tnfa = log1p(sputum_TNFa)
+  )
+
+```
+
+#### Prepare for plots
+```{r}
+# Create new x-axis labels
+new_labels <- c("Pre-exposure", "6h post-exposure", "24h post-exposure")
+clinical_data$time <- factor(clinical_data$time, levels = c("train", "post", "fu"))
+cells$time <- factor(cells$time, levels = c("train", "post", "fu"))
+cyto$time <- factor(cyto$time, levels = c("train", "post", "fu"))
+
+```
+
+#### Assess normality of inflmmatory cells and cytokines
+```{r}
+# Assess normality: QQ-plot
+
+png("qq_plots/pmn_per_qq.png", width = 6, height = 4, units = "in", res = 300)
+
+par(mfrow = c(1, 3))
+for (t in levels(cells$time)) {
+  subset <- cells$sputum_PMN_percentage[cells$time == t]
+  plot_title <- switch(t,
+                       "train" = "Neutrophil%: Pre-Exposure",
+                       "post" = "6h Post-Exposure",
+                       "fu" = "24h Post-Exposure")
+  qqnorm(subset, main = plot_title)
+  qqline(subset, col = "red")
+}
+
+dev.off()
+
+
+png("qq_plots/mac_mg_qq.png", width = 6, height = 4, units = "in", res = 300)
+
+par(mfrow = c(1, 3))
+for (t in levels(cells$time)) {
+  subset <- cells$sputum_macs_cells.mg[cells$time == t]
+  log_subset <- log1p(subset)
+  plot_title <- switch(t,
+                       "train" = "Macrophage/mg: Pre-Exposure",
+                       "post" = "6h Post-Exposure",
+                       "fu" = "24h Post-Exposure")
+  qqnorm(log_subset, main = plot_title)
+  qqline(log_subset, col = "red")
+}
+
+dev.off()
+
+
+png("qq_plots/il8_qq.png", width = 6, height = 4, units = "in", res = 300)
+
+par(mfrow = c(1, 3))
+for (t in levels(cyto$time)) {
+  subset <- cyto$sputum_il8[cyto$time == t]
+  log_subset <- log1p(subset)
+  plot_title <- switch(t,
+                       "train" = "IL-8: Pre-Exposure",
+                       "post" = "6h Post-Exposure",
+                       "fu" = "24h Post-Exposure")
+  qqnorm(log_subset, main = plot_title)
+  qqline(log_subset, col = "red")
+}
+
+dev.off()
+```
+
+
+### Macrophage% analysis and visualization
+```{r Mac% - one-way repeated measures ANOVA}
+res.aov_mac <- anova_test(data = cells, dv=sputum_mac_percentage, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_mac)
+
+pwc_mac <- cells %>% 
+  pairwise_t_test(
+    sputum_mac_percentage ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc_mac
+
+
+p3 <- ggplot(data = cells, 
+       aes(x = time, y = sputum_mac_percentage, group = subject, color)) +
+  geom_point(size = 3, show.legend = FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Macrophage %") +                    
+  xlab(NULL) +                              
+  theme_minimal()  
+
+pwc_mac <- pwc_mac %>% add_xy_position(x = "time")
+p3 <- p3 + 
+  stat_pvalue_manual(pwc_mac, hide.ns = TRUE, step.increase = 0.1,
+                     y.position = 100)+
+  labs(subtitle = NULL, caption = NULL)
+
+p3
+```
+```{r Mac% - two-way repeated measures ANOVA}
+res.aov_mac <- anova_test(
+  data = cells, 
+  dv=sputum_mac_percentage, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov_mac)
+
+# SEX EFFECT 
+pwc <- cells %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    sputum_mac_percentage ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+
+# EFFECT OF TIME
+pwc2 <- cells %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    sputum_mac_percentage ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p7 <- ggboxplot(cells, x = "time", y = "sputum_mac_percentage", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Macrophage %",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())
+
+
+pwc2 <- pwc2 %>% add_xy_position(x = "time")
+pwc <- pwc %>% add_xy_position(x = "time")
+p7 <- p7 + 
+  stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+                     y.position = 100,
+                     color = "purple")+
+  labs(subtitle = NULL, caption = NULL)
+
+p7 <- p7 + 
+  stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+                     y.position = 120)+
+  labs(subtitle = NULL, caption = NULL)
+p7
+```
+
+
+### PMN% analysis and plot
+```{r one-way repeated measures ANOVA}
+res.aov_pmn <- anova_test(data = cells, dv=sputum_PMN_percentage, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_pmn)
+
+pwc_pmn <- cells %>% 
+  pairwise_t_test(
+    sputum_PMN_percentage ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc_pmn
+
+
+p1 <- ggplot(data = cells, 
+       aes(x = time, y = sputum_PMN_percentage, group = subject)) +
+  geom_point(size = 3) +              
+  geom_line(alpha = 0.6) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Neutrophil %") +                    
+  xlab(NULL) +                              
+  theme_minimal() 
+
+pwc_pmn <- pwc_pmn %>% add_xy_position(x = "time")
+p1 <- p1 + 
+  stat_pvalue_manual(pwc_pmn, hide.ns = TRUE, step.increase = 0.1, y.position = 100) +
+  labs(
+    subtitle = NULL, caption = NULL
+  )
+
+p1
+```
+```{r PMN% - two-way repeated measures ANOVA}
+res.aov_pmn <- anova_test(
+  data = cells, 
+  dv=sputum_PMN_percentage, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov_pmn)
+
+# SEX EFFECT 
+pwc <- cells %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    sputum_PMN_percentage ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+
+# EFFECT OF TIME
+pwc2 <- cells %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    sputum_PMN_percentage ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p5 <- ggboxplot(cells, x = "time", y = "sputum_PMN_percentage", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Neutrophil %",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())
+
+
+pwc2 <- pwc2 %>% add_xy_position(x = "time")
+pwc <- pwc %>% add_xy_position(x = "time")
+
+p5 <- p5 + 
+  stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+                     y.position = 100,
+                     color = "purple")+
+  labs(subtitle = NULL, caption = NULL)
+
+p5 <- p5 + 
+  stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+                     y.position = 120)+
+  labs(subtitle = NULL, caption = NULL)
+p5
+```
+
+### Macrophages per mg
+```{r}
+res.aov_mac_mg <- anova_test(data = cells, dv=sputum_macs_cells.mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_mac_mg)
+
+pwc_mac_mg <- cells %>% 
+  pairwise_t_test(
+    sputum_macs_cells.mg ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc_mac_mg
+
+#absolute macs after log transformation
+res.aov_mac_mg <- anova_test(data = cells, dv = log_mac_mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_mac_mg)
+
+pwc_mac_mg <- cells %>% 
+  pairwise_t_test(
+    log_mac_mg ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc_mac_mg
+
+
+p4 <- ggplot(data = cells, 
+       aes(x = time, y = sputum_macs_cells.mg, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +  
+  ylab("Macrophages per sputum mg") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100, 1000, 10000),
+                     labels = c("1", "10", "100", "1,000", "10,000"))
+
+pwc_mac_mg <- pwc_mac_mg %>% add_xy_position(x = "time")
+p4 <- p4 + 
+  stat_pvalue_manual(pwc_mac_mg, hide.ns = TRUE, y.position = 3.8)+
+  labs(subtitle = NULL, caption = NULL)
+
+p4
+```
+```{r Macs/mg - two-way repeated measures ANOVA}
+res.aov_mac <- anova_test(
+  data = cells, 
+  dv=log_mac_mg, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov_mac)
+
+# SEX EFFECT 
+pwc <- cells %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    log_mac_mg ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+
+# EFFECT OF TIME
+pwc2 <- cells %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    log_mac_mg ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p8 <- ggboxplot(cells, x = "time", y = "sputum_macs_cells.mg", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Macrophage per Sputum mg",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100, 1000, 10000),
+                     labels = c("1", "10", "100", "1,000", "10,000"))
+
+
+pwc2 <- pwc2 %>% add_xy_position(x = "time")
+pwc <- pwc %>% add_xy_position(x = "time")
+
+p8 <- p8 + 
+  stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+                     y.position = 100,
+                     color = "purple")+
+  labs(subtitle = NULL, caption = NULL)
+
+p8 <- p8 + 
+  stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+                     y.position = 120)+
+  labs(subtitle = NULL, caption = NULL)
+p8
+```
+
+### Neutrophils per mg
+```{r PMN/mg - one-way repeated measures ANOVA}
+res.aov_pmn_mg <- anova_test(data = cells, dv=sputum_pmn_cells.mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_pmn_mg)
+
+
+#Log transform absolute neutrophils
+res.aov_pmn_mg <- anova_test(data = cells, dv= log_pmn_mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_pmn_mg)
+
+
+
+p2 <- ggplot(data = cells, 
+       aes(x = time, y = sputum_pmn_cells.mg, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Neutrophils per sputum mg") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10")
+
+p2
+```
+```{r PMN/mg - two-way repeated measures ANOVA}
+
+res.aov_pmn <- anova_test(
+  data = cells, 
+  dv=log_pmn_mg, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov_pmn)
+
+# SEX EFFECT 
+pwc <- cells %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    log_pmn_mg ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+
+# EFFECT OF TIME
+pwc2 <- cells %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    log_pmn_mg ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p6 <- ggboxplot(cells, x = "time", y = "sputum_pmn_cells.mg", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "Neutrophils per Sputum mg",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100, 1000),
+                     labels = c("1", "10", "100", "1,000"))
+
+pwc <- pwc %>% add_xy_position(x = "time")
+
+p6 <- p6 + 
+  stat_pvalue_manual(pwc, hide.ns = TRUE)+
+  labs(subtitle = NULL, caption = NULL)
+p6
+```
+
+### Combine plots
+```{r}
+combined <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+png("Inflammatory_cells_dot_line_plot_log.png", width = 13, height = 8, units = "in", res = 300)
+grid.draw(combined)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.01, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.5, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+### Combine plots by sex
+```{r}
+combined <- grid.arrange(p5, p6, p7, p8, ncol = 2)
+png("clinical_supp_figures/Inflammatory_cells_bySex.png", width = 13, height = 8, units = "in", res = 300)
+grid.draw(combined)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.01, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.5, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+## Total cells per mg
+```{r}
+res.aov_total <- anova_test(data = cells, dv=sputum._cells.mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_total) # ns
+
+# Log transformed data
+res.aov_total <- anova_test(data = cells, dv=log_total_mg, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_total) #ns
+
+p <- ggplot(data = cells, 
+       aes(x = time, y = sputum._cells.mg, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("Total Cells per Sputum mg") +                    
+  xlab(NULL) +                              
+  theme_classic () +
+  scale_y_continuous(trans = "log10")
+
+p
+
+ggsave("clinical_supp_figures/total_cells_mg.png", plot = p, width = 6, height = 4, dpi = 300)
+```
+#### Cytokine analysis
+```{r IL-1 beta}
+res.aov_il1b <- anova_test(data = cyto, dv=log_il1b, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_il1b)
+
+
+p1 <- ggplot(data = cyto, 
+       aes(x = time, y = sputum_il1b, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("IL-1 beta (pg/ml)") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10")
+
+p1
+
+```
+```{r IL-6}
+res.aov_il6 <- anova_test(data = cyto, dv=log_il6, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_il6)
+
+
+p2 <- ggplot(data = cyto, 
+       aes(x = time, y = sputum_il6, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("IL-6 (pg/ml)") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10")
+
+p2
+
+```
+```{r IL-8}
+res.aov_il8 <- anova_test(data = cyto, dv=log_il8, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_il8)
+
+
+p3 <- ggplot(data = cyto, 
+       aes(x = time, y = sputum_il8, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("IL-8 (pg/ml)") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10")
+
+p3
+
+```
+```{r TNF alpha}
+res.aov_tnfa <- anova_test(data = cyto, dv=log_tnfa, 
+             wid=subject,
+             within = time)
+get_anova_table(res.aov_tnfa)
+
+
+p4 <- ggplot(data = cyto, 
+       aes(x = time, y = sputum_TNFa, group = subject)) +
+  geom_point(size = 3, show.legend =  FALSE) +              
+  geom_line(alpha = 0.6, show.legend = FALSE) +            
+  stat_summary(fun = mean, geom = "line", aes(group = 1), 
+               color = "blue", linewidth = 1.2, linetype = "dashed") +  
+  stat_summary(fun = mean, geom = "point", aes(group = 1), 
+               color = "blue", size = 3) +  
+  scale_x_discrete(labels = new_labels) +   
+  ylab("TNF alpha (pg/ml)") +                    
+  xlab(NULL) +                              
+  theme_minimal() +
+  scale_y_continuous(trans = "log10")
+
+p4
+
+```
+```{r combine cyto data}
+combined <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+png("clinical_supp_figures/cyto.png", width = 13, height = 8, units = "in", res = 300)
+grid.draw(combined)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.01, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.5, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+```{r il-1 beta - two-way repeated measures ANOVA}
+res.aov <- anova_test(
+  data = cyto, 
+  dv=log_il1b, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov) #ns
+
+# SEX EFFECT 
+# pwc <- cyto %>%
+#   group_by(time) %>%
+#   pairwise_t_test(
+#     log_il1b ~ sex, paired = FALSE,
+#     p.adjust.method = "bonferroni"
+#     )
+# pwc
+# 
+# # EFFECT OF TIME
+# pwc2 <- cyto %>%
+#   group_by(sex) %>%
+#   pairwise_t_test(
+#     log_il1b ~ time, paired = TRUE,
+#     p.adjust.method = "bonferroni"
+#     )
+# pwc2
+
+p5 <- ggboxplot(cyto, x = "time", y = "sputum_il1b", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "IL-1 beta (pg/ml)",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10")
+
+
+# pwc2 <- pwc2 %>% add_xy_position(x = "time")
+# pwc <- pwc %>% add_xy_position(x = "time")
+# 
+# p5 <- p5 + 
+#   stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+#                      y.position = 100,
+#                      color = "purple")+
+#   labs(subtitle = NULL, caption = NULL)
+# 
+# p5 <- p5 + 
+#   stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+#                      y.position = 120)+
+#   labs(subtitle = NULL, caption = NULL)
+# p5
+```
+```{r il-6 - two-way repeated measures ANOVA}
+res.aov <- anova_test(
+  data = cyto, 
+  dv=log_il6, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov) 
+
+#SEX EFFECT
+pwc <- cyto %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    log_il6 ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+ 
+# EFFECT OF TIME
+pwc2 <- cyto %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    log_il6 ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p6 <- ggboxplot(cyto, x = "time", y = "sputum_il6", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "IL-6 (pg/ml)",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100),
+                     labels = c("1", "10", "100"))
+
+
+# pwc2 <- pwc2 %>% add_xy_position(x = "time")
+pwc <- pwc %>% add_xy_position(x = "time")
+ 
+# p5 <- p5 + 
+#   stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+#                      y.position = 100,
+#                      color = "purple")+
+#   labs(subtitle = NULL, caption = NULL)
+# 
+p6 <- p6 +
+  stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+                     y.position = 3)+
+  labs(subtitle = NULL, caption = NULL)
+p6
+```
+
+```{r il-8 - two-way repeated measures ANOVA}
+res.aov <- anova_test(
+  data = cyto, 
+  dv=log_il8, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov) 
+
+#SEX EFFECT
+pwc <- cyto %>%
+  group_by(time) %>%
+  pairwise_t_test(
+    log_il8 ~ sex, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+ 
+# EFFECT OF TIME
+pwc2 <- cyto %>%
+  group_by(sex) %>%
+  pairwise_t_test(
+    log_il8 ~ time, paired = TRUE,
+    p.adjust.method = "bonferroni"
+    )
+pwc2
+
+p7 <- ggboxplot(cyto, x = "time", y = "sputum_il8", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "IL-8 (pg/ml)",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100, 1000),
+                     labels = c("1", "10", "100", "1000"))
+
+
+# pwc2 <- pwc2 %>% add_xy_position(x = "time")
+pwc <- pwc %>% add_xy_position(x = "time")
+ 
+# p7 <- p7 + 
+#   stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+#                      y.position = 100,
+#                      color = "purple")+
+#   labs(subtitle = NULL, caption = NULL)
+# 
+p7 <- p7 +
+  stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+                     y.position = 4)+
+  labs(subtitle = NULL, caption = NULL)
+p7
+```
+
+```{r TNFa - two-way repeated measures ANOVA}
+res.aov <- anova_test(
+  data = cyto, 
+  dv=log_tnfa, 
+             wid=subject,
+             within = time,
+  between = sex)
+get_anova_table(res.aov) 
+
+#SEX EFFECT
+# pwc <- cyto %>%
+#   group_by(time) %>%
+#   pairwise_t_test(
+#     log_il8 ~ sex, paired = FALSE,
+#     p.adjust.method = "bonferroni"
+#     )
+# pwc
+ 
+# EFFECT OF TIME
+# pwc2 <- cyto %>%
+#   group_by(sex) %>%
+#   pairwise_t_test(
+#     log_il8 ~ time, paired = TRUE,
+#     p.adjust.method = "bonferroni"
+#     )
+# pwc2
+
+p8 <- ggboxplot(cyto, x = "time", y = "sputum_TNFa", add = "jitter", 
+                 color = "sex",
+                 palette = c("purple", "turquoise"), 
+                 ylab = "TNF alpha (pg/ml)",
+                 xlab = FALSE,
+                 bxp.errorbar = TRUE)+
+  scale_x_discrete(labels= new_labels)+
+  theme(legend.title = element_blank())+
+  scale_y_continuous(trans = "log10", 
+                     breaks = c(1, 10, 100),
+                     labels = c("1", "10", "100"))
+
+
+# pwc2 <- pwc2 %>% add_xy_position(x = "time")
+#pwc <- pwc %>% add_xy_position(x = "time")
+ 
+# p8 <- p8 + 
+#   stat_pvalue_manual(pwc2, hide.ns = TRUE, step.increase = 0.1,
+#                      y.position = 100,
+#                      color = "purple")+
+#   labs(subtitle = NULL, caption = NULL)
+ 
+# p8 <- p8 +
+#   stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase = 0.2,
+#                      y.position = 4)+
+#   labs(subtitle = NULL, caption = NULL)
+p8
+```
+```{r combine cyto by sex}
+combined <- grid.arrange(p5, p6, p7, p8, ncol = 2)
+png("clinical_supp_figures/Cyto_bySex.png", width = 13, height = 8, units = "in", res = 300)
+grid.draw(combined)
+grid.text("A", x = unit(0.01, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("B", x = unit(0.5, "npc"), y = unit(0.95, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("C", x = unit(0.01, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+grid.text("D", x = unit(0.5, "npc"), y = unit(0.48, "npc"), just = "left", gp = gpar(fontsize = 14, fontface = "bold"))
+
+dev.off()
+```
+
+
+
+

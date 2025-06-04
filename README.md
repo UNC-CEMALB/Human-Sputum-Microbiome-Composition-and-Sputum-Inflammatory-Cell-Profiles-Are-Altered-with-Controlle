@@ -1,1 +1,3 @@
-# Human airway microbiome composition and sputum inflammatory cell profiles are altered with controlled wood smoke exposure as a model for wildfire smoke
+# Human Sputum Microbiome Composition and Sputum Inflammatory Cell Profiles Are Altered with Controlled Wood Smoke Exposure as a Model for Wildfire Smoke
+
+This code was generated to support the manuscript entitled, "Human Sputum Microbiome Composition and Sputum Inflammatory Cell Profiles Are Altered with Controlled Wood Smoke Exposure as a Model for Wildfire Smoke", 
